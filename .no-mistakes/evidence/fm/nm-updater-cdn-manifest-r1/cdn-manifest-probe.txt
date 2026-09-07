@@ -1,0 +1,6 @@
+Live CDN manifest availability probe
+URL: https://github.com/kunchenguid/no-mistakes/releases/download/channels/channels.json
+Command: curl -fsSL https://github.com/kunchenguid/no-mistakes/releases/download/channels/channels.json
+Observed: HTTP 404 (curl exit 22)
+
+The channels release asset has not yet been deployed, so the target updater's anonymous production metadata path cannot be validated end-to-end in this run. Deploy .github/workflows/publish-channels.yml and run its workflow_dispatch trigger to provide the required live manifest.
