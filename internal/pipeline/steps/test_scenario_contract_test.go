@@ -554,11 +554,27 @@ func TestTestStep_InvalidAnalyzerPayloadTriggersCorrectionRound(t *testing.T) {
 				t.Fatalf("first evidence prompt must not be a correction round:\n%s", first)
 			}
 			correction := ag.calls[1].Prompt
-			if !strings.Contains(correction, "were REJECTED") {
-				t.Fatalf("correction prompt missing rejection framing:\n%s", correction)
+			for _, want := range []string{
+				"were REJECTED",
+				"This is a correction-only turn",
+				"Do not use tools, execute commands, start or modify the product, rerun scenarios, or perform any external operation",
+				"Preserve its supported observations and findings without inventing new evidence",
+				"Downgrade every unsupported pass or fail",
+				"<rejected-json>",
+				tc.wantPrompt,
+			} {
+				if !strings.Contains(correction, want) {
+					t.Fatalf("correction prompt missing %q:\n%s", want, correction)
+				}
 			}
-			if !strings.Contains(correction, tc.wantPrompt) {
-				t.Fatalf("correction prompt missing actionable error %q:\n%s", tc.wantPrompt, correction)
+			for _, replayed := range []string{
+				"You are validating a code change by driving the product itself",
+				"Show users a success screen after checkout",
+				"drive each scenario end-to-end against that running product",
+			} {
+				if strings.Contains(correction, replayed) {
+					t.Fatalf("correction prompt replayed evidence-task instruction %q:\n%s", replayed, correction)
+				}
 			}
 			findings, err := types.ParseFindingsJSON(outcome.Findings)
 			if err != nil {
