@@ -501,6 +501,11 @@ const untestedWithoutReasonFindingsJSON = `{
   "verdict": "inconclusive"
 }`
 
+type rejectedStructuredOutputError struct{ message string }
+
+func (e rejectedStructuredOutputError) Error() string                { return e.message }
+func (rejectedStructuredOutputError) StructuredOutputRejected() bool { return true }
+
 // TestTestStep_InvalidAnalyzerPayloadTriggersCorrectionRound is the
 // recoverability contract: a pass that was not live-validated, or an
 // untested scenario missing a reason, is returned to the analyzer with an
@@ -587,6 +592,65 @@ func TestTestStep_InvalidAnalyzerPayloadTriggersCorrectionRound(t *testing.T) {
 				t.Fatalf("mixed live-pass + untested-with-reason must not park, findings: %s", outcome.Findings)
 			}
 		})
+	}
+}
+
+func TestTestStep_FinalizerRejectionTriggersCorrectionRound(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	calls := 0
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			calls++
+			if calls == 1 {
+				return nil, rejectedStructuredOutputError{message: "structured output did not match schema: missing scenarios"}
+			}
+			return &agent.Result{Output: json.RawMessage(mixedLivePassAndUntestedFindingsJSON)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+
+	outcome, err := (&TestStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatalf("finalizer rejection must enter the bounded correction round: %v", err)
+	}
+	if len(ag.calls) != 2 {
+		t.Fatalf("agent calls = %d, want one rejected invocation plus one correction", len(ag.calls))
+	}
+	if !strings.Contains(ag.calls[1].Prompt, "structured output did not match schema: missing scenarios") {
+		t.Fatalf("correction prompt omitted the finalizer error:\n%s", ag.calls[1].Prompt)
+	}
+	if outcome.NeedsApproval {
+		t.Fatalf("valid corrected payload must not park, findings: %s", outcome.Findings)
+	}
+}
+
+func TestTestStep_MalformedJSONTriggersCorrectionRound(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	calls := 0
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			calls++
+			if calls == 1 {
+				return &agent.Result{Output: json.RawMessage(`{"findings": [}`)}, nil
+			}
+			return &agent.Result{Output: json.RawMessage(mixedLivePassAndUntestedFindingsJSON)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+
+	outcome, err := (&TestStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatalf("malformed JSON must enter the bounded correction round: %v", err)
+	}
+	if len(ag.calls) != 2 {
+		t.Fatalf("agent calls = %d, want one malformed payload plus one correction", len(ag.calls))
+	}
+	if outcome.NeedsApproval {
+		t.Fatalf("valid corrected payload must not park, findings: %s", outcome.Findings)
 	}
 }
 
