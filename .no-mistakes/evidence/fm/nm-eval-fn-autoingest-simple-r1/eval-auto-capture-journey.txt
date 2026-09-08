@@ -1,0 +1,24 @@
+=== RUN   TestEvalAutoCaptureJourney
+    eval_test.go:196: eval sets output after an ordinary run:
+        ╭─ eval case sets ────────────────────────────────────────────────────────────╮
+        │                                                                             │
+        │   Diversified holdout (official gold-only set)                              │
+        │   Cases                0   pins 0 · cap 32                                  │
+        │   Gold findings        0   across 0 gold case(s)                            │
+        │                                                                             │
+        │   Self-score: the recorded reviews scored against their own gold            │
+        │     unlabeled / pending (no finding-level gold yet)                         │
+        │                                                                             │
+        │   Other sets                                                                │
+        │   all         1 case(s) · 0 gold · 1 unlabeled / pending · 0 queued         │
+        │   labeled     0 case(s) · 0 gold · 0 unlabeled / pending · 0 queued         │
+        │   tune        0 case(s) · 0 gold · 0 unlabeled / pending · 0 queued         │
+        │                                                                             │
+        │   ⚠ diversified is empty: no labeled gold (unlabeled cases are not filled)  │
+        │                                                                             │
+        │   local-only: cases, gold, and scores never leave this machine              │
+        │                                                                             │
+        ╰─────────────────────────────────────────────────────────────────────────────╯
+--- PASS: TestEvalAutoCaptureJourney (3.83s)
+PASS
+ok  	github.com/kunchenguid/no-mistakes/internal/e2e	4.211s
