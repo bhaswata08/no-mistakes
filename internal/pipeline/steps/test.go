@@ -154,10 +154,8 @@ Previous test findings to address:
 		}
 	}
 	trustedRunbook := trustedTestInstructionsSection(sctx)
-	evidenceCtx, cancelEvidence, evidenceTimeout := testAgentContext(sctx)
-	result, err := sctx.RunAgentContext(evidenceCtx, agent.RunOpts{
-		Prompt: fmt.Sprintf(
-			`You are validating a code change by driving the product itself. Derive the scenarios this change must satisfy, then run each one against the real running product.
+	evidencePrompt := fmt.Sprintf(
+		`You are validating a code change by driving the product itself. Derive the scenarios this change must satisfy, then run each one against the real running product.
 
 Context:
 - branch: %s
@@ -212,30 +210,17 @@ Rules:
 - Do NOT report passing tests (whether existing or new), test counts, coverage summaries, or other non-actionable information.
 - If every scenario passes and there are no issues, return an empty findings array.
 - Set action to "ask-user" when a test failure seems desired and you question the author's intent of having the test in the first place. Set action to "auto-fix" for objective failures that can be safely fixed. Set action to "no-op" for informational notes.%s`,
-			sctx.Run.Branch,
-			baseSHA,
-			sctx.Run.HeadSHA,
-			configuredTestCommand,
-			trustedRunbook,
-			evidenceGuidance,
-			reassessHistory,
-		),
-		CWD:        sctx.WorkDir,
-		JSONSchema: testFindingsSchema,
-		OnChunk:    sctx.LogChunk,
-	})
-	runErr := testAgentError(evidenceCtx, evidenceTimeout, "agent run tests", err)
-	cancelEvidence()
-	if runErr != nil {
-		return nil, runErr
-	}
-
-	var findings Findings
-	if result.Output == nil {
-		return nil, errors.New("test analyzer returned no structured findings")
-	}
-	if err := unmarshalRequiredTestFindings(result.Output, &findings); err != nil {
-		return nil, fmt.Errorf("validate test analyzer findings: %w", err)
+		sctx.Run.Branch,
+		baseSHA,
+		sctx.Run.HeadSHA,
+		configuredTestCommand,
+		trustedRunbook,
+		evidenceGuidance,
+		reassessHistory,
+	)
+	findings, err := runTestAnalyzer(sctx, evidencePrompt)
+	if err != nil {
+		return nil, err
 	}
 	if len(tested) > 0 {
 		findings.Tested = append(append([]string{}, tested...), findings.Tested...)
@@ -272,6 +257,80 @@ Rules:
 		ExitCode:      baselineExitCode,
 		FixSummary:    fixSummary,
 	}, nil
+}
+
+// testAnalyzerMaxAttempts is the number of evidence-analyzer invocations
+// allowed for one Test step Execute, including the first. An invalid
+// findings payload is not a product defect: it is returned to the analyzer
+// with the validation errors so the caller can correct and resubmit. Only
+// exhausting this bound is a genuine blocking failure. The bound is
+// independent of auto_fix.test, which is for repairing the product rather
+// than correcting structured output.
+const testAnalyzerMaxAttempts = 3
+
+func runTestAnalyzer(sctx *pipeline.StepContext, prompt string) (Findings, error) {
+	current := prompt
+	var lastErr error
+	for attempt := 1; attempt <= testAnalyzerMaxAttempts; attempt++ {
+		if attempt > 1 {
+			sctx.Log(fmt.Sprintf(
+				"test analyzer findings rejected (%s); asking agent to correct and resubmit (attempt %d of %d)",
+				strings.ReplaceAll(lastErr.Error(), "\n", "; "),
+				attempt,
+				testAnalyzerMaxAttempts,
+			))
+		}
+		evidenceCtx, cancel, timeout := testAgentContext(sctx)
+		result, err := sctx.RunAgentContext(evidenceCtx, agent.RunOpts{
+			Prompt:     current,
+			CWD:        sctx.WorkDir,
+			JSONSchema: testFindingsSchema,
+			OnChunk:    sctx.LogChunk,
+		})
+		runErr := testAgentError(evidenceCtx, timeout, "agent run tests", err)
+		cancel()
+		if runErr != nil {
+			return Findings{}, runErr
+		}
+		findings, valErr := parseTestAnalyzerOutput(result)
+		if valErr == nil {
+			return findings, nil
+		}
+		lastErr = valErr
+		if attempt == testAnalyzerMaxAttempts {
+			break
+		}
+		var rejected []byte
+		if result != nil {
+			rejected = result.Output
+		}
+		current = testAnalyzerCorrectionPrompt(prompt, valErr, rejected)
+	}
+	return Findings{}, fmt.Errorf("validate test analyzer findings after %d attempts: %w", testAnalyzerMaxAttempts, lastErr)
+}
+
+func parseTestAnalyzerOutput(result *agent.Result) (Findings, error) {
+	if result == nil || result.Output == nil {
+		return Findings{}, errors.New("test analyzer returned no structured findings")
+	}
+	var findings Findings
+	if err := unmarshalRequiredTestFindings(result.Output, &findings); err != nil {
+		return Findings{}, err
+	}
+	return findings, nil
+}
+
+func testAnalyzerCorrectionPrompt(original string, err error, rejected []byte) string {
+	var b strings.Builder
+	b.WriteString(original)
+	b.WriteString("\n\nYour previous structured findings were REJECTED because they violate the live-validation contract. This is invalid input, not a product defect. Correct the JSON and resubmit the full findings object. Do not guess a pass.\n\nValidation errors:\n")
+	b.WriteString(sanitizePromptMultilineText(err.Error()))
+	if len(rejected) > 0 {
+		b.WriteString("\n\nRejected payload:\n")
+		b.WriteString(sanitizePromptMultilineText(string(rejected)))
+	}
+	b.WriteString("\n\nThe contract is unchanged: result \"pass\" or \"fail\" requires live=true and non-empty evidence; result \"untested\" requires live=false and a reason naming the specific tool, credential, permission, or authority that stopped you. If you did not drive a scenario against the live product, mark it result \"untested\" with a reason instead of \"pass\".\n")
+	return b.String()
 }
 
 func trustedTestInstructionsSection(sctx *pipeline.StepContext) string {

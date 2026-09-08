@@ -3,6 +3,7 @@ package steps
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -325,7 +326,7 @@ func TestTestStep_MissingScenarioContractFails(t *testing.T) {
 		{
 			name:    "pass must be live",
 			output:  `{"findings":[],"summary":"","tested":["ok"],"testing_summary":"ok","artifacts":[],"scenarios":[{"name":"x","result":"pass","live":false,"evidence":"ok","reason":""}],"verdict":"go"}`,
-			wantErr: "requires live validation",
+			wantErr: `result "pass" but live=false`,
 		},
 		{
 			name:    "pass requires evidence",
@@ -340,7 +341,12 @@ func TestTestStep_MissingScenarioContractFails(t *testing.T) {
 		{
 			name:    "untested cannot be live",
 			output:  `{"findings":[],"summary":"","tested":["ok"],"testing_summary":"ok","artifacts":[],"scenarios":[{"name":"x","result":"untested","live":true,"evidence":"","reason":"no browser"}],"verdict":"inconclusive"}`,
-			wantErr: "untested but marked live",
+			wantErr: `result "untested" but live=true`,
+		},
+		{
+			name:    "untested without a reason",
+			output:  `{"findings":[],"summary":"","tested":["ok"],"testing_summary":"ok","artifacts":[],"scenarios":[{"name":"x","result":"untested","live":false,"evidence":"","reason":""}],"verdict":"inconclusive"}`,
+			wantErr: `result "untested" without a reason`,
 		},
 		{
 			name:    "go cannot override failure",
@@ -360,7 +366,7 @@ func TestTestStep_MissingScenarioContractFails(t *testing.T) {
 		{
 			name:    "no-surface cannot cover a claimed pass without live",
 			output:  `{"findings":[],"summary":"","tested":["ok"],"testing_summary":"ok","artifacts":[],"scenarios":[{"name":"x","result":"pass","live":false,"evidence":"ok","reason":""}],"verdict":"no-surface"}`,
-			wantErr: "requires live validation",
+			wantErr: `result "pass" but live=false`,
 		},
 		{
 			name:    "protocol vocabulary is exact",
@@ -382,6 +388,12 @@ func TestTestStep_MissingScenarioContractFails(t *testing.T) {
 			_, err := (&TestStep{}).Execute(sctx)
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("Execute() error = %v, want one naming %q", err, tc.wantErr)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprintf("after %d attempts", testAnalyzerMaxAttempts)) {
+				t.Fatalf("Execute() error = %v, want the exhausted correction bound named", err)
+			}
+			if len(ag.calls) != testAnalyzerMaxAttempts {
+				t.Fatalf("agent calls = %d, want %d bounded correction attempts before failing", len(ag.calls), testAnalyzerMaxAttempts)
 			}
 		})
 	}
@@ -453,6 +465,178 @@ func TestTestStep_NoLiveSurfaceCIWorkflowAsksUser(t *testing.T) {
 	}
 	if len(types.AutoFixableFindings(findings).Items) != 0 {
 		t.Fatalf("no-surface must not be auto-fixable, got %s", outcome.Findings)
+	}
+}
+
+const mixedLivePassAndUntestedFindingsJSON = `{
+  "findings": [],
+  "summary": "",
+  "tested": ["manual check"],
+  "testing_summary": "partly driven",
+  "artifacts": [],
+  "scenarios": [
+    {"name":"user reaches the success screen","result":"pass","live":true,"evidence":"checkout.png","reason":""},
+    {"name":"payment declines are shown","result":"untested","live":false,"evidence":"","reason":"no card sandbox credential on this machine"}
+  ],
+  "verdict": "go"
+}`
+
+const passNotLiveFindingsJSON = `{
+  "findings": [],
+  "summary": "",
+  "tested": ["adapter stub"],
+  "testing_summary": "adapter stubbed the scenario",
+  "artifacts": [],
+  "scenarios": [{"name":"adapter handles the request","result":"pass","live":false,"evidence":"stub","reason":""}],
+  "verdict": "go"
+}`
+
+const untestedWithoutReasonFindingsJSON = `{
+  "findings": [],
+  "summary": "",
+  "tested": ["read the diff"],
+  "testing_summary": "could not drive live",
+  "artifacts": [],
+  "scenarios": [{"name":"user reaches the success screen","result":"untested","live":false,"evidence":"","reason":""}],
+  "verdict": "inconclusive"
+}`
+
+// TestTestStep_InvalidAnalyzerPayloadTriggersCorrectionRound is the
+// recoverability contract: a pass that was not live-validated, or an
+// untested scenario missing a reason, is returned to the analyzer with an
+// actionable message so it can resubmit. The step must not fail the run on
+// that first invalid payload.
+func TestTestStep_InvalidAnalyzerPayloadTriggersCorrectionRound(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		invalid    string
+		wantPrompt string
+	}{
+		{
+			name:       "pass with live false",
+			invalid:    passNotLiveFindingsJSON,
+			wantPrompt: `scenario 1: result "pass" but live=false - if you did not drive this against the live product, mark it result "untested" with a reason instead of "pass"`,
+		},
+		{
+			name:       "untested without a reason",
+			invalid:    untestedWithoutReasonFindingsJSON,
+			wantPrompt: `scenario 1: result "untested" without a reason - name the specific tool, credential, permission, or authority that stopped you, and how to provide it`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir, baseSHA, headSHA := setupGitRepo(t)
+			invalid := tc.invalid
+			calls := 0
+			ag := &mockAgent{
+				name: "test",
+				runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+					calls++
+					if calls == 1 {
+						return &agent.Result{Output: json.RawMessage(invalid)}, nil
+					}
+					return &agent.Result{Output: json.RawMessage(mixedLivePassAndUntestedFindingsJSON)}, nil
+				},
+			}
+			sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+			sctx.UserIntent = "Show users a success screen after checkout"
+
+			outcome, err := (&TestStep{}).Execute(sctx)
+			if err != nil {
+				t.Fatalf("invalid payload must be returned to the analyzer, not fail the step: %v", err)
+			}
+			if len(ag.calls) != 2 {
+				t.Fatalf("agent calls = %d, want 1 rejected payload plus 1 correction", len(ag.calls))
+			}
+			first := ag.calls[0].Prompt
+			if strings.Contains(first, "were REJECTED") {
+				t.Fatalf("first evidence prompt must not be a correction round:\n%s", first)
+			}
+			correction := ag.calls[1].Prompt
+			if !strings.Contains(correction, "were REJECTED") {
+				t.Fatalf("correction prompt missing rejection framing:\n%s", correction)
+			}
+			if !strings.Contains(correction, tc.wantPrompt) {
+				t.Fatalf("correction prompt missing actionable error %q:\n%s", tc.wantPrompt, correction)
+			}
+			findings, err := types.ParseFindingsJSON(outcome.Findings)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if findings.Verdict != types.TestVerdictGo || len(findings.Scenarios) != 2 {
+				t.Fatalf("corrected payload was not accepted: %+v", findings)
+			}
+			if outcome.NeedsApproval {
+				t.Fatalf("mixed live-pass + untested-with-reason must not park, findings: %s", outcome.Findings)
+			}
+		})
+	}
+}
+
+// TestTestStep_InvalidAnalyzerPayloadExhaustsCorrectionBound proves the
+// loop is bounded: a payload that stays invalid is a genuine blocking
+// failure after testAnalyzerMaxAttempts, never an infinite resubmit.
+func TestTestStep_InvalidAnalyzerPayloadExhaustsCorrectionBound(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			return &agent.Result{Output: json.RawMessage(passNotLiveFindingsJSON)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+
+	outcome, err := (&TestStep{}).Execute(sctx)
+	if err == nil {
+		t.Fatal("a payload that stays invalid must fail after the correction bound")
+	}
+	if outcome != nil {
+		t.Fatalf("Execute() outcome = %+v, want no outcome after the bound is exhausted", outcome)
+	}
+	if len(ag.calls) != testAnalyzerMaxAttempts {
+		t.Fatalf("agent calls = %d, want %d", len(ag.calls), testAnalyzerMaxAttempts)
+	}
+	got := err.Error()
+	if !strings.Contains(got, fmt.Sprintf("after %d attempts", testAnalyzerMaxAttempts)) {
+		t.Fatalf("error = %q, want the exhausted bound named", got)
+	}
+	if !strings.Contains(got, `result "pass" but live=false`) {
+		t.Fatalf("error = %q, want the actionable validation reason", got)
+	}
+	if !strings.Contains(ag.calls[1].Prompt, `scenario 1: result "pass" but live=false`) {
+		t.Fatalf("retry prompt never told the analyzer how to correct:\n%s", ag.calls[1].Prompt)
+	}
+}
+
+func TestTestStep_ValidMixedPayloadDoesNotRetry(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(context.Context, agent.RunOpts) (*agent.Result, error) {
+			return &agent.Result{Output: json.RawMessage(mixedLivePassAndUntestedFindingsJSON)}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+
+	outcome, err := (&TestStep{}).Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ag.calls) != 1 {
+		t.Fatalf("agent calls = %d, want 1: a valid mixed payload must not enter a correction round", len(ag.calls))
+	}
+	if outcome.NeedsApproval {
+		t.Fatalf("mixed live-pass + untested-with-reason must not park, findings: %s", outcome.Findings)
+	}
+	findings, err := types.ParseFindingsJSON(outcome.Findings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if findings.Verdict != types.TestVerdictGo || len(findings.Scenarios) != 2 {
+		t.Fatalf("valid mixed payload was not retained: %+v", findings)
 	}
 }
 
